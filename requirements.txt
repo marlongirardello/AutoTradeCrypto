@@ -1,9 +1,10 @@
-spl-token-client
 python-telegram-bot
 pandas
 pandas_ta
 httpx
 python-dotenv
-solders
-solana
+solders==0.20.0
+solana==0.32.0
+spl-token-client==0.7.0
 ccxt
+
