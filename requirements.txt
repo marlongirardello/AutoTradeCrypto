@@ -3,8 +3,9 @@ pandas
 pandas_ta
 httpx
 python-dotenv
-solders==0.20.0
-solana==0.32.0
-spl-token-client==0.7.0
+solders==0.19.0
+solana==0.31.0
+spl-token-client==0.6.0
 ccxt
+
 
