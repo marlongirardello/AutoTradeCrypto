@@ -5,5 +5,5 @@ httpx
 python-dotenv
 solders
 solana
-spl-token
+spl-token-client
 ccxt
