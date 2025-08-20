@@ -1,11 +1,11 @@
-# Usar uma imagem base oficial do Python
-FROM python:3.10-slim
+# Usar uma imagem base oficial e estável do Python
+FROM python:3.10-slim-bullseye
 
 # Definir o diretório de trabalho dentro do contentor
 WORKDIR /app
 
-# Instalar as ferramentas de compilação necessárias
-RUN apt-get update && apt-get install -y build-essential curl
+# Instalar as ferramentas de compilação essenciais do sistema
+RUN apt-get update && apt-get install -y build-essential curl pkg-config libssl-dev
 
 # Instalar a linguagem Rust (necessária para as bibliotecas da Solana)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
