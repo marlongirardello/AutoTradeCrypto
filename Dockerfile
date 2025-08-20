@@ -1,5 +1,5 @@
-# Usar uma imagem base oficial e estável do Python
-FROM python:3.10-slim-bullseye
+# Usar uma imagem base oficial e completa do Python para garantir todas as ferramentas de compilação
+FROM python:3.10-bullseye
 
 # Definir o diretório de trabalho dentro do contentor
 WORKDIR /app
@@ -14,7 +14,8 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Copiar o ficheiro de requisitos para o contentor
 COPY requirements.txt .
 
-# Instalar as bibliotecas Python
+# Atualizar o pip e instalar as bibliotecas Python
+RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar o resto do código da aplicação para o contentor
