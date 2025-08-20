@@ -19,7 +19,7 @@ from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from spl.token.instructions import get_associated_token_address
 
-# --- Carrega as variáveis de ambiente do arquivo .env ---
+# --- Carrega as variáveis de ambiente (funciona localmente e no Replit/Railway) ---
 load_dotenv()
 
 # --- Configurações Iniciais ---
@@ -30,7 +30,7 @@ RPC_URL = os.getenv("RPC_URL")
 
 # --- Validação de Configurações ---
 if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
-    print("Erro: Verifique se todas as variáveis de ambiente estão definidas no arquivo .env:")
+    print("Erro: Verifique se todas as variáveis de ambiente estão definidas:")
     print("TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_BASE58, RPC_URL")
     exit()
 
@@ -80,13 +80,11 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, 
     
     async with httpx.AsyncClient() as client:
         try:
-            # 1. Obter cotação
             quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
             quote_res = await client.get(quote_url)
             quote_res.raise_for_status()
             quote_response = quote_res.json()
 
-            # 2. Obter transação
             swap_payload = {
                 "userPublicKey": str(payer.pubkey()),
                 "quoteResponse": quote_response,
@@ -100,7 +98,6 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, 
             if not swap_tx_b64:
                 logger.error(f"Erro na resposta da API de swap da Jupiter: {swap_response}"); return None
 
-            # 3. Desserializar, assinar e enviar a transação
             raw_tx_bytes = b64decode(swap_tx_b64)
             swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
             
@@ -158,14 +155,19 @@ async def execute_sell_order(reason="Venda Manual"):
     except Exception as e:
         logger.error(f"Erro ao buscar saldo para venda: {e}"); await send_telegram_message(f"⚠️ Falha ao buscar saldo do token para venda: {e}")
 
-async def fetch_dexscreener_ohlcv(pair_address, timeframe):
-    resolution_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "1D"}
-    resolution = resolution_map.get(timeframe)
-    if not resolution:
-        logger.error(f"Timeframe '{timeframe}' não suportado pelo Dexscreener.")
+# --- FUNÇÃO PARA BUSCAR DADOS DO GECKOTERMINAL ---
+async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
+    timeframe_map = {"1m": "minute", "5m": "minute", "15m": "minute", "1h": "hour", "4h": "hour", "1d": "day"}
+    aggregate_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 1, "4h": 4, "1d": 1}
+    
+    gt_timeframe = timeframe_map.get(timeframe)
+    gt_aggregate = aggregate_map.get(timeframe)
+    
+    if not gt_timeframe:
+        logger.error(f"Timeframe '{timeframe}' não suportado pelo GeckoTerminal.")
         return None
 
-    url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}/ohlcv?resolution={resolution}&limit=300"
+    url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pair_address}/ohlcv/{gt_timeframe}?aggregate={gt_aggregate}&limit=300"
     
     try:
         async with httpx.AsyncClient() as client:
@@ -173,22 +175,21 @@ async def fetch_dexscreener_ohlcv(pair_address, timeframe):
             response.raise_for_status()
             api_data = response.json()
 
-            if not api_data.get('ohlcv'):
-                logger.warning("Dexscreener não retornou dados de velas (ohlcv).")
+            if api_data.get('data') and api_data['data'].get('attributes', {}).get('ohlcv_list'):
+                ohlcv_list = api_data['data']['attributes']['ohlcv_list']
+                df = pd.DataFrame(ohlcv_list, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                    df[col] = pd.to_numeric(df[col])
+                return df.sort_values(by='timestamp').reset_index(drop=True)
+            else:
+                logger.warning(f"GeckoTerminal não retornou dados de velas. Resposta: {api_data}")
                 return None
-
-            df = pd.DataFrame(api_data['ohlcv'])
-            df.rename(columns={'t': 'timestamp', 'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'}, inplace=True)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                df[col] = pd.to_numeric(df[col])
-            return df
     except httpx.HTTPStatusError as e:
-        logger.error(f"Erro de HTTP ao buscar dados no Dexscreener: {e.response.text}")
+        logger.error(f"Erro de HTTP ao buscar dados no GeckoTerminal: {e.response.text}")
         return None
     except Exception as e:
-        logger.error(f"Erro inesperado ao processar dados do Dexscreener: {e}")
+        logger.error(f"Erro inesperado ao processar dados do GeckoTerminal: {e}")
         return None
 
 async def check_strategy():
@@ -200,17 +201,17 @@ async def check_strategy():
         timeframe, ma_period = parameters["timeframe"], int(parameters["ma_period"])
         amount, stop_loss_percent = parameters["amount"], parameters["stop_loss_percent"]
         
-        logger.info(f"Buscando dados de candles para {pair_details['base_symbol']}/{pair_details['quote_symbol']} no Dexscreener...")
+        logger.info(f"Buscando dados de candles para {pair_details['base_symbol']}/{pair_details['quote_symbol']} no GeckoTerminal...")
 
-        data = await fetch_dexscreener_ohlcv(pair_details['pair_address'], timeframe)
+        data = await fetch_geckoterminal_ohlcv(pair_details['pair_address'], timeframe)
 
         if data is None or data.empty:
-            await send_telegram_message(f"⚠️ Não foi possível obter dados de velas do Dexscreener para o par.")
+            await send_telegram_message(f"⚠️ Não foi possível obter dados de velas do GeckoTerminal. Verifique se o par tem liquidez e um histórico de negociação.")
             return
 
         if len(data) < ma_period + 2:
-            logger.warning(f"Dados insuficientes do Dexscreener.")
-            await send_telegram_message(f"⚠️ Dados insuficientes para a análise do par.")
+            logger.warning(f"Dados insuficientes do GeckoTerminal ({len(data)} velas).")
+            await send_telegram_message(f"⚠️ Dados insuficientes do GeckoTerminal para a análise do par.")
             return
 
         sma_col = f'SMA_{ma_period}'
@@ -222,14 +223,14 @@ async def check_strategy():
         current_close, current_sma = current_candle['Close'], current_candle[sma_col]
         previous_close, previous_sma = previous_candle['Close'], previous_candle[sma_col]
         
-        logger.info(f"Análise ({pair_details['base_symbol']}): Preço Atual {current_close:.6f} | Média Atual {current_sma:.6f}")
+        logger.info(f"Análise ({pair_details['base_symbol']}): Preço Atual {current_close:.8f} | Média Atual {current_sma:.8f}")
 
         if in_position:
             stop_loss_price = entry_price * (1 - stop_loss_percent / 100)
-            logger.info(f"Posição aberta. Preço de entrada: {entry_price:.6f}, Stop-Loss: {stop_loss_price:.6f}")
+            logger.info(f"Posição aberta. Preço de entrada: {entry_price:.8f}, Stop-Loss: {stop_loss_price:.8f}")
             
             if current_close <= stop_loss_price:
-                await execute_sell_order(reason=f"Stop-Loss atingido em {stop_loss_price:.6f}")
+                await execute_sell_order(reason=f"Stop-Loss atingido em {stop_loss_price:.8f}")
                 return
 
             sell_signal = previous_close >= previous_sma and current_close < current_sma
@@ -253,7 +254,7 @@ async def send_telegram_message(message):
 async def start(update, context):
     await update.effective_message.reply_text(
         'Olá! Sou seu bot de autotrade para a rede Solana.\n'
-        'A análise é feita via **Dexscreener** e a negociação via **Jupiter**.\n'
+        'A análise é feita via **GeckoTerminal** e a negociação via **Jupiter**.\n'
         'Use o comando `/set` para configurar:\n'
         '`/set <ENDEREÇO_DO_CONTRATO> <SÍMBOLO_DA_COTAÇÃO> <TIMEFRAME> <MA> <VALOR> <STOP_%>`\n\n'
         '**Exemplo (WIF/SOL):**\n'
@@ -289,10 +290,14 @@ async def set_params(update, context):
             token_res = response.json()
 
         if not token_res.get('pairs'):
-            await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para o contrato fornecido.")
+            await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado no Dexscreener para o contrato fornecido.")
             return
         
-        valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') == quote_symbol_input]
+        accepted_symbols = [quote_symbol_input]
+        if quote_symbol_input == 'SOL':
+            accepted_symbols.append('WSOL')
+
+        valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') in accepted_symbols]
         
         if not valid_pairs:
             await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado para este contrato.")
@@ -314,16 +319,16 @@ async def set_params(update, context):
                 "base_address": trade_pair['baseToken']['address'],
                 "quote_address": trade_pair['quoteToken']['address'],
                 "pair_address": trade_pair['pairAddress'],
-                "quote_decimals": 9 if quote_token_symbol == "SOL" else 6 
+                "quote_decimals": 9 if quote_token_symbol in ['SOL', 'WSOL'] else 6 
             }
         }
         await update.effective_message.reply_text(
             f"✅ *Parâmetros definidos com sucesso!*\n\n"
-            f"📊 *Fonte de Dados:* `Dexscreener`\n"
+            f"📊 *Fonte de Dados:* `GeckoTerminal`\n"
             f"🪙 *Par de Negociação:* `{base_token_symbol}/{quote_token_symbol}`\n"
             f"⏰ *Timeframe:* `{timeframe}`\n"
             f"📈 *Média Móvel:* `{ma_period}` períodos\n"
-            f"💰 *Valor por Ordem:* `{amount}` {quote_token_symbol}\n"
+            f"💰 *Valor por Ordem:* `{amount}` {quote_symbol_input}\n"
             f"📉 *Stop-Loss:* `{stop_loss_percent}%`",
             parse_mode='Markdown'
         )
@@ -351,7 +356,7 @@ async def run_bot(update, context):
     
     bot_running = True
     logger.info("Bot de trade iniciado.")
-    await update.effective_message.reply_text("🚀 Bot iniciado! Verificando a estratégia via Dexscreener...")
+    await update.effective_message.reply_text("🚀 Bot iniciado! Verificando a estratégia via GeckoTerminal...")
     
     if periodic_task is None or periodic_task.done():
         periodic_task = asyncio.create_task(periodic_checker())
