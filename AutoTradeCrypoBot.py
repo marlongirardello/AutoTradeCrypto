@@ -173,8 +173,9 @@ async def execute_sell_order(reason="Venda Manual"):
     except Exception as e:
         logger.error(f"Erro ao buscar saldo para venda: {e}"); await send_telegram_message(f"⚠️ Falha ao buscar saldo do token para venda: {e}")
 
-# --- NOVA FUNÇÃO PARA BUSCAR DADOS DO GECKOTERMINAL ---
+# --- FUNÇÕES DE DADOS ---
 async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
+    """Busca o histórico de velas no GeckoTerminal."""
     timeframe_map = {"1m": "minute", "5m": "minute", "15m": "minute", "1h": "hour", "4h": "hour", "1d": "day"}
     aggregate_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 1, "4h": 4, "1d": 1}
 
@@ -189,7 +190,7 @@ async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(url)
+            response = await client.get(url, timeout=10.0)
             response.raise_for_status()
             api_data = response.json()
 
@@ -210,6 +211,35 @@ async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
         logger.error(f"Erro inesperado ao processar dados do GeckoTerminal: {e}")
         return None
 
+# --- NOVA FUNÇÃO PARA BUSCAR PREÇO NO DEXSCREENER ---
+async def fetch_dexscreener_real_time_price(pair_address, quote_symbol):
+    """Busca o preço em tempo real no Dexscreener."""
+    url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(url, timeout=10.0)
+            res.raise_for_status()
+            pair_data = res.json().get('pair')
+            if not pair_data:
+                logger.warning(f"Dexscreener não retornou dados para o par {pair_address}")
+                return None
+
+            price_str = None
+            if quote_symbol in ['SOL', 'WSOL']:
+                price_str = pair_data.get('priceNative')
+            else:
+                price_str = pair_data.get('priceUsd')
+            
+            if price_str:
+                return float(price_str)
+            else:
+                logger.warning(f"Não foi possível encontrar o preço para o símbolo {quote_symbol} no Dexscreener.")
+                return None
+    except Exception as e:
+        logger.error(f"Erro ao buscar preço em tempo real no Dexscreener: {e}")
+        return None
+
+# --- ESTRATÉGIA ATUALIZADA ---
 async def check_strategy():
     global in_position, entry_price
     if not bot_running or not all(p is not None for p in parameters.values() if p != parameters['trade_pair_details']): return
@@ -219,50 +249,58 @@ async def check_strategy():
         timeframe, ma_period = parameters["timeframe"], int(parameters["ma_period"])
         amount, stop_loss_percent = parameters["amount"], parameters["stop_loss_percent"]
 
+        # 1. Busca dados históricos para calcular a Média Móvel
         logger.info(f"Buscando dados de candles para {pair_details['base_symbol']}/{pair_details['quote_symbol']} no GeckoTerminal...")
-
         data = await fetch_geckoterminal_ohlcv(pair_details['pair_address'], timeframe)
 
-        if data is None or data.empty:
-            await send_telegram_message(f"⚠️ Não foi possível obter dados de velas do GeckoTerminal. Verifique se o par tem liquidez e um histórico de negociação.")
-            return
-
-        if len(data) < ma_period + 2:
-            logger.warning(f"Dados insuficientes do GeckoTerminal ({len(data)} velas).")
+        if data is None or data.empty or len(data) < ma_period + 2:
+            logger.warning(f"Dados históricos insuficientes do GeckoTerminal ({len(data) if data is not None else 0} velas).")
             await send_telegram_message(f"⚠️ Dados insuficientes do GeckoTerminal para a análise do par.")
             return
 
+        # 2. Busca o preço em tempo real para tomar a decisão
+        logger.info("Buscando preço em tempo real no Dexscreener...")
+        real_time_price = await fetch_dexscreener_real_time_price(pair_details['pair_address'], pair_details['quote_symbol'])
+        
+        if real_time_price is None:
+            await send_telegram_message("⚠️ Não foi possível obter o preço em tempo real do Dexscreener para a análise.")
+            return
+
+        # 3. Calcula a Média Móvel e prepara os dados das velas
         sma_col = f'SMA_{ma_period}'
         data.ta.sma(length=ma_period, append=True)
-
+        
         previous_candle = data.iloc[-3]
-        current_candle = data.iloc[-2]
+        current_candle = data.iloc[-2] # A média é calculada sobre a última vela FECHADA
 
-        current_close, current_sma = current_candle['Close'], current_candle[sma_col]
+        current_sma = current_candle[sma_col]
         previous_close, previous_sma = previous_candle['Close'], previous_candle[sma_col]
 
-        logger.info(f"Análise ({pair_details['base_symbol']}): Preço Atual {current_close:.8f} | Média Atual {current_sma:.8f}")
+        # 4. Análise e Decisão usando o preço em tempo real
+        logger.info(f"Análise ({pair_details['base_symbol']}): Preço Real-Time {real_time_price:.8f} | Média da Última Vela {current_sma:.8f}")
 
         if in_position:
             stop_loss_price = entry_price * (1 - stop_loss_percent / 100)
             logger.info(f"Posição aberta. Preço de entrada: {entry_price:.8f}, Stop-Loss: {stop_loss_price:.8f}")
 
-            if current_close <= stop_loss_price:
+            if real_time_price <= stop_loss_price:
                 await execute_sell_order(reason=f"Stop-Loss atingido em {stop_loss_price:.8f}")
                 return
 
-            sell_signal = previous_close >= previous_sma and current_close < current_sma
+            # A venda compara o preço em tempo real com a média da vela anterior
+            sell_signal = previous_close >= previous_sma and real_time_price < current_sma
             if sell_signal:
                 await execute_sell_order(reason="Cruzamento de Média Móvel")
                 return
 
-        buy_signal = previous_close <= previous_sma and current_close > current_sma
+        # A compra compara o preço em tempo real com a média da vela anterior
+        buy_signal = previous_close <= previous_sma and real_time_price > current_sma
         if not in_position and buy_signal:
             logger.info("Sinal de COMPRA detectado.")
-            await execute_buy_order(amount, current_close)
+            await execute_buy_order(amount, real_time_price)
 
     except Exception as e:
-        logger.error(f"Ocorreu um erro em check_strategy: {e}")
+        logger.error(f"Ocorreu um erro em check_strategy: {e}", exc_info=True)
         await send_telegram_message(f"⚠️ Erro inesperado ao executar a estratégia: {e}")
 
 async def send_telegram_message(message):
@@ -272,7 +310,8 @@ async def send_telegram_message(message):
 async def start(update, context):
     await update.effective_message.reply_text(
         'Olá! Sou seu bot de autotrade para a rede Solana.\n'
-        'A análise é feita via **GeckoTerminal** e a negociação via **Jupiter**.\n'
+        'A análise é feita com histórico do **GeckoTerminal** e preço em tempo real do **Dexscreener**.\n'
+        'A negociação é via **Jupiter**.\n'
         'Use o comando `/set` para configurar:\n'
         '`/set <ENDEREÇO_DO_CONTRATO> <SÍMBOLO_DA_COTAÇÃO> <TIMEFRAME> <MA> <VALOR> <STOP_%>`\n\n'
         '**Exemplo (WIF/SOL):**\n'
@@ -280,8 +319,8 @@ async def start(update, context):
         '**Comandos:**\n'
         '• `/run` - Inicia o bot.\n'
         '• `/stop` - Para o bot.\n'
-        '• `/buy` - Força uma compra (teste).\n'
-        '• `/sell` - Força uma venda (teste).',
+        '• `/buy` - Força uma compra.\n'
+        '• `/sell` - Força uma venda.',
         parse_mode='Markdown'
     )
 
@@ -303,7 +342,6 @@ async def set_params(update, context):
             return
         check_interval_seconds = interval_map[timeframe]
 
-        # Usa Dexscreener apenas para encontrar o pair_address, que é mais eficiente para isso
         token_search_url = f"https://api.dexscreener.com/latest/dex/tokens/{base_token_contract}"
         async with httpx.AsyncClient() as client:
             response = await client.get(token_search_url)
@@ -345,7 +383,7 @@ async def set_params(update, context):
         }
         await update.effective_message.reply_text(
             f"✅ *Parâmetros definidos com sucesso!*\n\n"
-            f"📊 *Fonte de Dados:* `GeckoTerminal`\n"
+            f"📊 *Fonte de Dados:* `GeckoTerminal (Histórico) + Dexscreener (Preço Real)`\n"
             f"🪙 *Par de Negociação:* `{base_token_symbol}/{quote_token_symbol}`\n"
             f"⏰ *Timeframe:* `{timeframe}`\n"
             f"📈 *Média Móvel:* `{ma_period}` períodos\n"
@@ -377,7 +415,7 @@ async def run_bot(update, context):
 
     bot_running = True
     logger.info("Bot de trade iniciado.")
-    await update.effective_message.reply_text("🚀 Bot iniciado! Verificando a estratégia via GeckoTerminal...")
+    await update.effective_message.reply_text("🚀 Bot iniciado! Verificando a estratégia...")
 
     if periodic_task is None or periodic_task.done():
         periodic_task = asyncio.create_task(periodic_checker())
@@ -412,26 +450,14 @@ async def manual_buy(update, context):
     await update.effective_message.reply_text("Forçando ordem de compra...")
     try:
         pair_details = parameters['trade_pair_details']
-        pair_address = pair_details['pair_address']
-        quote_symbol = pair_details['quote_symbol']
+        
+        # Usa a nova função para buscar preço no Dexscreener
+        real_time_price = await fetch_dexscreener_real_time_price(pair_details['pair_address'], pair_details['quote_symbol'])
 
-        # Busca o preço atual no Dexscreener para ser mais rápido
-        url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
-        async with httpx.AsyncClient() as client:
-            res = await client.get(url)
-            res.raise_for_status()
-            pair_data = res.json()['pair']
-
-            current_price = 0.0
-            if quote_symbol in ['SOL', 'WSOL']:
-                current_price = float(pair_data['priceNative'])
-            else: # Assume USDC ou outra stablecoin
-                current_price = float(pair_data['priceUsd'])
-
-            if current_price > 0:
-                await execute_buy_order(parameters["amount"], current_price)
-            else:
-                raise ValueError("Preço obtido inválido")
+        if real_time_price is not None and real_time_price > 0:
+            await execute_buy_order(parameters["amount"], real_time_price)
+        else:
+            raise ValueError("Preço obtido inválido ou nulo")
 
     except Exception as e:
         logger.error(f"Erro ao buscar preço para compra manual: {e}")
