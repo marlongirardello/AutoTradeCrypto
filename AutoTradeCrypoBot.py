@@ -1,3 +1,4 @@
+# --- Bibliotecas Essenciais ---
 import telegram
 from telegram.ext import Application, CommandHandler
 import logging
@@ -8,7 +9,7 @@ import asyncio
 from base64 import b64decode
 import pandas as pd
 import pandas_ta as ta
-import httpx # Biblioteca para requisições assíncronas
+import httpx  # Biblioteca para requisições assíncronas
 
 # --- Libs da Solana ---
 from solders.pubkey import Pubkey
@@ -19,10 +20,10 @@ from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from spl.token.instructions import get_associated_token_address
 
+# --- Servidor Web para Keep-Alive (Replit, etc.) ---
 from flask import Flask
 from threading import Thread
 
-# --- CÓDIGO DO SERVIDOR WEB ---
 app = Flask('')
 
 @app.route('/')
@@ -30,25 +31,24 @@ def home():
     return "Bot is alive!"
 
 def run_server():
-  app.run(host='0.0.0.0',port=8080)
+    app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
     t = Thread(target=run_server)
     t.start()
-# --- FIM DO CÓDIGO DO SERVIDOR ---
 
-# --- Carrega as variáveis de ambiente ---
+# --- Carregamento de Variáveis de Ambiente ---
 load_dotenv()
 
-# --- Configurações Iniciais ---
+# --- Configurações Iniciais e Validação ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY_BASE58")
 RPC_URL = os.getenv("RPC_URL")
 
-# --- Validação de Configurações ---
 if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
-    print("Erro: Verifique se todas as variáveis de ambiente estão definidas.")
+    print("ERRO: Verifique se todas as variáveis de ambiente estão definidas:")
+    print("TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_BASE58, RPC_URL")
     exit()
 
 # --- Configuração do Logging ---
@@ -67,17 +67,15 @@ try:
     solana_client = Client(RPC_URL)
     logger.info(f"Carteira carregada com sucesso. Endereço público: {payer.pubkey()}")
 except Exception as e:
-    logger.error(f"Erro ao carregar a carteira Solana: {e}")
+    logger.error(f"Erro ao carregar a carteira Solana. Verifique sua chave privada e o RPC URL. Erro: {e}")
     exit()
 
-# --- Constantes ---
+# --- Constantes e Variáveis Globais ---
 # Par SOL/USDC de alta liquidez da Raydium para fallback
 SOL_USDC_PAIR_ADDRESS = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqb_AB2M_AcV1G_c"
-
-# --- Variáveis Globais ---
 bot_running = False
 in_position = False
-entry_price = 0.0
+entry_price = 0.0  # Sempre armazenado em USD
 check_interval_seconds = 3600
 periodic_task = None
 parameters = {
@@ -91,43 +89,48 @@ parameters = {
 }
 application = None
 
-# --- Funções de Execução de Ordem (Sem alterações) ---
+# --- Funções de Execução de Ordem (Jupiter API) ---
 async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=100):
-    logger.info(f"Iniciando swap de {amount} do token {input_mint_str} para {output_mint_str}")
+    logger.info(f"Iniciando swap de {amount} de {input_mint_str} para {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     async with httpx.AsyncClient() as client:
         try:
             quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
-            quote_res = await client.get(quote_url)
+            quote_res = await client.get(quote_url, timeout=20.0)
             quote_res.raise_for_status()
             quote_response = quote_res.json()
+
             swap_payload = {"userPublicKey": str(payer.pubkey()), "quoteResponse": quote_response, "wrapAndUnwrapSol": True}
             swap_url = "https://quote-api.jup.ag/v6/swap"
-            swap_res = await client.post(swap_url, json=swap_payload)
+            swap_res = await client.post(swap_url, json=swap_payload, timeout=20.0)
             swap_res.raise_for_status()
             swap_response = swap_res.json()
             swap_tx_b64 = swap_response.get('swapTransaction')
             if not swap_tx_b64:
-                logger.error(f"Erro na API de swap da Jupiter: {swap_response}"); return None
+                logger.error(f"Erro na resposta da API de swap da Jupiter: {swap_response}"); return None
+
             raw_tx_bytes = b64decode(swap_tx_b64)
             swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
             signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
             signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
+
             tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
             tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+
             logger.info(f"Transação enviada com sucesso! Assinatura: {tx_signature}")
             solana_client.confirm_transaction(tx_signature, commitment="confirmed")
             logger.info(f"Transação confirmada! Link: https://solscan.io/tx/{tx_signature}")
             return str(tx_signature)
+
         except httpx.HTTPStatusError as e:
-            logger.error(f"Erro HTTP na API da Jupiter: {e.response.text}"); await send_telegram_message(f"⚠️ Falha na Jupiter: {e.response.text}"); return None
+            logger.error(f"Erro de HTTP na API da Jupiter: {e.response.text}"); await send_telegram_message(f"⚠️ Falha na comunicação com a Jupiter: {e.response.text}"); return None
         except Exception as e:
             logger.error(f"Falha na transação: {e}"); await send_telegram_message(f"⚠️ Falha na transação on-chain: {e}"); return None
 
 async def execute_buy_order(amount, price_usd):
     global in_position, entry_price
     details = parameters["trade_pair_details"]
-    logger.info(f"EXECUTANDO ORDEM DE COMPRA de {amount} {details['quote_symbol']} para {details['base_symbol']} a {price_usd} USD")
+    logger.info(f"EXECUTANDO ORDEM DE COMPRA REAL de {amount} {details['quote_symbol']} para {details['base_symbol']} ao preço de {price_usd} USD")
     entry_price = price_usd
     tx_sig = await execute_swap(details['quote_address'], details['base_address'], amount, details['quote_decimals'])
     if tx_sig:
@@ -140,7 +143,7 @@ async def execute_buy_order(amount, price_usd):
 async def execute_sell_order(reason="Venda Manual"):
     global in_position, entry_price
     details = parameters["trade_pair_details"]
-    logger.info(f"EXECUTANDO ORDEM DE VENDA de {details['base_symbol']}. Motivo: {reason}")
+    logger.info(f"EXECUTANDO ORDEM DE VENDA REAL do token {details['base_symbol']}. Motivo: {reason}")
     try:
         token_mint_pubkey = Pubkey.from_string(details['base_address'])
         ata_address = get_associated_token_address(payer.pubkey(), token_mint_pubkey)
@@ -149,19 +152,22 @@ async def execute_sell_order(reason="Venda Manual"):
         amount_to_sell_wei = int(token_balance_data.amount)
         token_decimals = token_balance_data.decimals
         amount_to_sell = amount_to_sell_wei / (10**token_decimals)
+
         if amount_to_sell_wei == 0:
-            logger.warning("Tentativa de venda com saldo zero."); in_position = False; entry_price = 0.0; return
+            logger.warning("Tentativa de venda com saldo zero. Resetando posição."); in_position = False; entry_price = 0.0; return
+
         tx_sig = await execute_swap(details['base_address'], details['quote_address'], amount_to_sell, token_decimals)
         if tx_sig:
             in_position = False; entry_price = 0.0
             await send_telegram_message(f"🛑 VENDA REALIZADA: {amount_to_sell:.6f} de {details['base_symbol']}\nMotivo: {reason}\nhttps://solscan.io/tx/{tx_sig}")
         else:
-            await send_telegram_message(f"❌ FALHA NA VENDA de {details['base_symbol']}")
+            await send_telegram_message(f"❌ FALHA NA VENDA do token {details['base_symbol']}")
     except Exception as e:
-        logger.error(f"Erro ao buscar saldo para venda: {e}"); await send_telegram_message(f"⚠️ Falha ao buscar saldo: {e}")
+        logger.error(f"Erro ao buscar saldo para venda: {e}"); await send_telegram_message(f"⚠️ Falha ao buscar saldo do token para venda: {e}")
 
-# --- FUNÇÕES DE DADOS (Sem alterações) ---
+# --- Funções de Obtenção de Dados ---
 async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
+    """Busca o histórico de velas no GeckoTerminal."""
     timeframe_map = {"1m": "minute", "5m": "minute", "15m": "minute", "1h": "hour", "4h": "hour", "1d": "day"}
     aggregate_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 1, "4h": 4, "1d": 1}
     gt_timeframe, gt_aggregate = timeframe_map.get(timeframe), aggregate_map.get(timeframe)
@@ -184,6 +190,7 @@ async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
         logger.error(f"Erro ao buscar dados no GeckoTerminal: {e}"); return None
 
 async def fetch_dexscreener_prices(pair_address):
+    """Busca preços (USD e Nativo) no Dexscreener."""
     url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
     try:
         async with httpx.AsyncClient() as client:
@@ -193,16 +200,14 @@ async def fetch_dexscreener_prices(pair_address):
             if not pair_data: return None
             price_usd_str = pair_data.get('priceUsd')
             price_native_str = pair_data.get('priceNative')
-            quote_token_price_usd_str = pair_data.get('quoteToken', {}).get('priceUsd')
             return {
                 "pair_price_usd": float(price_usd_str) if price_usd_str else None,
                 "pair_price_native": float(price_native_str) if price_native_str else None,
-                "quote_price_usd": float(quote_token_price_usd_str) if quote_token_price_usd_str else None,
             }
     except Exception as e:
         logger.error(f"Erro ao buscar preços no Dexscreener: {e}"); return None
 
-# --- ESTRATÉGIA ATUALIZADA E ROBUSTA ---
+# --- LÓGICA CENTRAL DA ESTRATÉGIA ---
 async def check_strategy():
     global in_position, entry_price
     if not bot_running or not all(p is not None for p in parameters.values() if p != parameters['trade_pair_details']): return
@@ -212,74 +217,78 @@ async def check_strategy():
         timeframe, ma_period = parameters["timeframe"], int(parameters["ma_period"])
         amount, stop_loss_percent = parameters["amount"], parameters["stop_loss_percent"]
 
+        # 1. Busca os preços em tempo real
         logger.info("Buscando preços em tempo real no Dexscreener...")
         price_data = await fetch_dexscreener_prices(pair_details['pair_address'])
-        
-        if not price_data or price_data.get('pair_price_usd') is None:
-            await send_telegram_message("⚠️ Não foi possível obter os preços do Dexscreener para a análise.")
+        if not price_data or price_data.get('pair_price_usd') is None or price_data.get('pair_price_native') is None:
+            await send_telegram_message("⚠️ Não foi possível obter os preços completos (USD e Nativo) do Dexscreener.")
             return
 
         real_time_price_usd = price_data['pair_price_usd']
         real_time_price_native = price_data['pair_price_native']
-        
-        logger.info(f"Preços atuais ({pair_details['base_symbol']}): ${real_time_price_usd:.6f} | {real_time_price_native:.6f} {pair_details['quote_symbol']}")
 
+        # 2. Busca dados históricos (preços na moeda nativa, ex: SOL)
         data = await fetch_geckoterminal_ohlcv(pair_details['pair_address'], timeframe)
         if data is None or data.empty or len(data) < ma_period + 2:
-            logger.warning(f"Dados históricos insuficientes do GeckoTerminal.")
-            await send_telegram_message(f"⚠️ Dados insuficientes do GeckoTerminal para a análise.")
+            await send_telegram_message("⚠️ Dados históricos insuficientes para a análise.")
             return
 
-        # --- LÓGICA ROBUSTA PARA OBTER PREÇO DO SOL/QUOTE ---
-        is_sol_pair = pair_details['quote_symbol'] in ['SOL', 'WSOL']
-        if is_sol_pair:
-            quote_price_usd = None
-            
-            # 1. Tenta calcular a partir dos dados do par principal
-            if real_time_price_usd and real_time_price_native and real_time_price_native > 0:
-                quote_price_usd = real_time_price_usd / real_time_price_native
-                logger.info(f"Preço do SOL em USD calculado a partir do par: ${quote_price_usd:.4f}")
-            
-            # 2. Se o cálculo falhar, usa o fallback para o par SOL/USDC
-            if not quote_price_usd:
-                logger.warning("Não foi possível calcular o preço do SOL. Usando par de fallback SOL/USDC...")
-                sol_price_data = await fetch_dexscreener_prices(SOL_USDC_PAIR_ADDRESS)
-                if sol_price_data and sol_price_data['pair_price_usd']:
-                    quote_price_usd = sol_price_data['pair_price_usd']
-                    logger.info(f"Preço do SOL em USD obtido do par de fallback: ${quote_price_usd:.4f}")
-
-            # 3. Se ambos falharem, aborta a execução
-            if not quote_price_usd:
-                logger.error("ERRO CRÍTICO: Não foi possível obter o preço do SOL em USD para conversão.")
-                await send_telegram_message("⚠️ Falha CRÍTICA ao obter preço do SOL em USD. A análise não pode continuar.")
-                return
-            
-            # Converte todo o dataframe histórico para USD
-            for col in ['Open', 'High', 'Low', 'Close']:
-                data[col] = data[col] * quote_price_usd
-        
+        # 3. Calcula a Média Móvel na moeda nativa (ex: SOL)
         sma_col = f'SMA_{ma_period}'
-        data.ta.sma(length=ma_period, append=True)
+        data.ta.sma(close=data['Close'], length=ma_period, append=True)
         
         previous_candle = data.iloc[-3]
         current_candle = data.iloc[-2]
-        current_sma_usd = current_candle[sma_col]
-        previous_close_usd, previous_sma_usd = previous_candle['Close'], previous_candle[sma_col]
 
+        current_sma_native = current_candle[sma_col]
+        previous_close_native = previous_candle['Close']
+        previous_sma_native = previous_candle[sma_col]
+
+        # 4. LOG DE ANÁLISE NA MOEDA NATIVA (EX: SOL)
+        logger.info(f"Análise ({pair_details['quote_symbol']}): Preço Real-Time {real_time_price_native:.8f} | Média da Última Vela {current_sma_native:.8f}")
+
+        # 5. CONVERSÃO E LOG EM USD
+        is_sol_pair = pair_details['quote_symbol'] in ['SOL', 'WSOL']
+        quote_price_usd = 1.0 # Padrão para pares já em USD (ex: USDC)
+
+        if is_sol_pair:
+            sol_price_usd = None
+            if real_time_price_usd and real_time_price_native > 0:
+                sol_price_usd = real_time_price_usd / real_time_price_native
+            
+            if not sol_price_usd: # Fallback se o cálculo falhar
+                logger.warning("Não foi possível calcular o preço do SOL. Usando par de fallback SOL/USDC...")
+                sol_price_data = await fetch_dexscreener_prices(SOL_USDC_PAIR_ADDRESS)
+                if sol_price_data and sol_price_data['pair_price_usd']:
+                    sol_price_usd = sol_price_data['pair_price_usd']
+
+            if not sol_price_usd:
+                 logger.error("Falha CRÍTICA ao obter preço do SOL para conversão do log.")
+                 await send_telegram_message("⚠️ Não foi possível converter a Média Móvel para USD para o log.")
+                 return
+            
+            quote_price_usd = sol_price_usd
+            
+        current_sma_usd = current_sma_native * quote_price_usd
+        
+        # LOG DE ANÁLISE EM USD
         logger.info(f"Análise (USD): Preço Real-Time ${real_time_price_usd:.8f} | Média da Última Vela ${current_sma_usd:.8f}")
 
+        # 6. Lógica de Decisão
         if in_position:
-            stop_loss_price = entry_price * (1 - stop_loss_percent / 100)
-            logger.info(f"Posição aberta. Entrada(USD): ${entry_price:.8f}, Stop(USD): ${stop_loss_price:.8f}")
-            if real_time_price_usd <= stop_loss_price:
-                await execute_sell_order(reason=f"Stop-Loss atingido em ${stop_loss_price:.8f}")
+            stop_loss_price_usd = entry_price * (1 - stop_loss_percent / 100)
+            logger.info(f"Posição aberta. Entrada(USD): ${entry_price:.8f}, Stop(USD): ${stop_loss_price_usd:.8f}")
+
+            if real_time_price_usd <= stop_loss_price_usd:
+                await execute_sell_order(reason=f"Stop-Loss atingido em ${stop_loss_price_usd:.8f}")
                 return
-            sell_signal = previous_close_usd >= previous_sma_usd and real_time_price_usd < current_sma_usd
+
+            sell_signal = previous_close_native >= previous_sma_native and real_time_price_native < current_sma_native
             if sell_signal:
                 await execute_sell_order(reason="Cruzamento de Média Móvel")
                 return
 
-        buy_signal = previous_close_usd <= previous_sma_usd and real_time_price_usd > current_sma_usd
+        buy_signal = previous_close_native <= previous_sma_native and real_time_price_native > current_sma_native
         if not in_position and buy_signal:
             logger.info("Sinal de COMPRA detectado.")
             await execute_buy_order(amount, real_time_price_usd)
@@ -288,7 +297,7 @@ async def check_strategy():
         logger.error(f"Ocorreu um erro em check_strategy: {e}", exc_info=True)
         await send_telegram_message(f"⚠️ Erro inesperado na estratégia: {e}")
 
-# --- Funções do Telegram (sem alterações significativas) ---
+# --- Funções e Comandos do Telegram ---
 async def send_telegram_message(message):
     if application:
         await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
@@ -297,9 +306,9 @@ async def start(update, context):
     await update.effective_message.reply_text(
         'Olá! Sou seu bot de autotrade para a rede Solana.\n'
         'A análise é feita com histórico do **GeckoTerminal** e preço em tempo real do **Dexscreener**.\n'
-        'A negociação é via **Jupiter**.\n'
+        'A negociação é via **Jupiter**.\n\n'
         'Use o comando `/set` para configurar:\n'
-        '`/set <ENDEREÇO_DO_CONTRATO> <SÍMBOLO_DA_COTAÇÃO> <TIMEFRAME> <MA> <VALOR> <STOP_%>`\n\n'
+        '`/set <ENDEREÇO_DO_TOKEN> <SÍMBOLO_COTAÇÃO> <TIMEFRAME> <MA> <VALOR> <STOP_%>`\n\n'
         '**Exemplo (WIF/SOL):**\n'
         '`/set EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzL7M6fV2zY2g6 SOL 1h 21 0.1 7`\n\n'
         '**Comandos:**\n'
@@ -311,7 +320,7 @@ async def start(update, context):
     )
 
 async def set_params(update, context):
-    global parameters, bot_running, check_interval_seconds
+    global parameters, check_interval_seconds
     if bot_running:
         await update.effective_message.reply_text("Pare o bot com /stop antes de alterar os parâmetros.")
         return
@@ -320,26 +329,32 @@ async def set_params(update, context):
         quote_symbol_input = context.args[1].upper()
         timeframe, ma_period = context.args[2].lower(), int(context.args[3])
         amount, stop_loss_percent = float(context.args[4]), float(context.args[5])
+
         interval_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
         if timeframe not in interval_map:
-            await update.effective_message.reply_text(f"⚠️ Timeframe '{timeframe}' não suportado.")
-            return
+            await update.effective_message.reply_text(f"⚠️ Timeframe '{timeframe}' não suportado."); return
         check_interval_seconds = interval_map[timeframe]
+
         token_search_url = f"https://api.dexscreener.com/latest/dex/tokens/{base_token_contract}"
         async with httpx.AsyncClient() as client:
             response = await client.get(token_search_url)
             response.raise_for_status()
             token_res = response.json()
+
         if not token_res.get('pairs'):
             await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para o contrato."); return
+
         accepted_symbols = [quote_symbol_input]
         if quote_symbol_input == 'SOL': accepted_symbols.append('WSOL')
+        
         valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') in accepted_symbols]
         if not valid_pairs:
             await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado."); return
+
         trade_pair = max(valid_pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
         base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$')
         quote_token_symbol = trade_pair['quoteToken']['symbol']
+
         parameters = {
             "base_token_symbol": base_token_symbol, "quote_token_symbol": quote_token_symbol,
             "timeframe": timeframe, "ma_period": ma_period, "amount": amount,
@@ -420,6 +435,7 @@ async def manual_sell(update, context):
     await update.effective_message.reply_text("Forçando ordem de venda...")
     await execute_sell_order()
 
+# --- Loop Principal e Inicialização ---
 async def periodic_checker():
     logger.info(f"Verificador periódico iniciado: intervalo de {check_interval_seconds}s.")
     while True:
@@ -432,19 +448,21 @@ async def periodic_checker():
             logger.info("Verificador periódico cancelado."); break
         except Exception as e:
             logger.error(f"Erro no loop periódico: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(60) # Espera um pouco mais em caso de erro
 
 def main():
     global application
-    keep_alive()
+    keep_alive()  # Inicia o servidor web
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("set", set_params))
     application.add_handler(CommandHandler("run", run_bot))
     application.add_handler(CommandHandler("stop", stop_bot))
     application.add_handler(CommandHandler("buy", manual_buy))
     application.add_handler(CommandHandler("sell", manual_sell))
-    logger.info("Bot do Telegram iniciado...")
+
+    logger.info("Bot do Telegram iniciado e aguardando comandos...")
     application.run_polling()
 
 if __name__ == '__main__':
