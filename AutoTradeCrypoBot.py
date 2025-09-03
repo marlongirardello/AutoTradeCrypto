@@ -61,24 +61,22 @@ except Exception as e:
     logger.error(f"Erro ao carregar a carteira Solana: {e}"); exit()
 
 # --- Constantes e Variáveis Globais ---
-SOL_USDC_PAIR_ADDRESS = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqb_AB2M_AcV1G_c"
 bot_running = False
 in_position = False
-entry_price = 0.0 # Armazenado em USD
-position_high_price = 0.0 # Armazena a máxima da posição para o Trailing Stop
+entry_price = 0.0
+position_high_price = 0.0
 check_interval_seconds = 3600
 periodic_task = None
 parameters = {
     "base_token_symbol": None, "quote_token_symbol": None, "timeframe": None,
     "ma_period": None, "amount": None,
-    "take_profit_percent": None, 
-    "trailing_stop_percent": None,
+    "take_profit_percent": None, "trailing_stop_percent": None,
     "trade_pair_details": {}
 }
 application = None
 
 # --- Funções de Execução de Ordem (Jupiter API) ---
-async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=1000): # Slippage 1%
+async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=1000):
     logger.info(f"Iniciando swap de {amount} de {input_mint_str} para {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     async with httpx.AsyncClient() as client:
@@ -96,9 +94,7 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, 
             tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
             logger.info(f"Transação enviada: {tx_signature}"); solana_client.confirm_transaction(tx_signature, commitment="confirmed")
             logger.info(f"Transação confirmada: https://solscan.io/tx/{tx_signature}"); return str(tx_signature)
-        except httpx.HTTPStatusError as e: logger.error(f"Erro HTTP na Jupiter: {e.response.text}"); await send_telegram_message(f"⚠️ Falha na Jupiter: {e.response.text}"); return None
         except Exception as e: logger.error(f"Falha na transação: {e}"); await send_telegram_message(f"⚠️ Falha on-chain: {e}"); return None
-
 async def execute_buy_order(amount, price_usd):
     global in_position, entry_price, position_high_price
     details = parameters["trade_pair_details"]; logger.info(f"EXECUTANDO COMPRA de {amount} {details['quote_symbol']} para {details['base_symbol']} a ${price_usd}")
@@ -109,7 +105,6 @@ async def execute_buy_order(amount, price_usd):
     else:
         in_position = False; entry_price = 0.0; position_high_price = 0.0
         await send_telegram_message(f"❌ FALHA NA COMPRA de {details['base_symbol']}")
-
 async def execute_sell_order(reason="Venda Manual"):
     global in_position, entry_price, position_high_price
     details = parameters["trade_pair_details"]; logger.info(f"EXECUTANDO VENDA de {details['base_symbol']}. Motivo: {reason}")
@@ -151,11 +146,11 @@ async def fetch_dexscreener_prices(pair_address):
         async with httpx.AsyncClient() as client:
             res = await client.get(url, timeout=10.0); res.raise_for_status(); pair_data = res.json().get('pair')
             if not pair_data: return None
-            price_usd_str = pair_data.get('priceUsd'); price_native_str = pair_data.get('priceNative')
-            return {"pair_price_usd": float(price_usd_str) if price_usd_str else None, "pair_price_native": float(price_native_str) if price_native_str else None}
+            price_usd_str = pair_data.get('priceUsd')
+            return {"price_usd": float(price_usd_str) if price_usd_str else None}
     except Exception as e: logger.error(f"Erro ao buscar preços no Dexscreener: {e}"); return None
 
-# --- LÓGICA CENTRAL DA ESTRATÉGIA ---
+# --- LÓGICA CENTRAL DA ESTRATÉGIA (BASEADA EM USD) ---
 async def check_strategy():
     global in_position, entry_price, position_high_price
     if not bot_running or not all(p is not None for p in {k: v for k, v in parameters.items() if k != 'trade_pair_details'}): return
@@ -168,30 +163,14 @@ async def check_strategy():
         historic_data = await fetch_geckoterminal_ohlcv(pair_details['pair_address'], timeframe)
         
         if not price_data or historic_data is None or historic_data.empty: await send_telegram_message("⚠️ Falha ao obter dados. Análise abortada."); return
-        real_time_price_native = price_data.get('pair_price_native'); real_time_price_usd = price_data.get('pair_price_usd')
-        if not real_time_price_native or not real_time_price_usd or len(historic_data) < ma_period: await send_telegram_message("⚠️ Dados insuficientes. Análise abortada."); return
+        real_time_price_usd = price_data.get('price_usd')
+        if not real_time_price_usd or len(historic_data) < ma_period: await send_telegram_message("⚠️ Dados insuficientes. Análise abortada."); return
         
-        last_historic_close = historic_data.iloc[-1]['Close']
-        discrepancy_ratio = last_historic_close / real_time_price_native if real_time_price_native > 0 else 0
-        if discrepancy_ratio > 100 or discrepancy_ratio < 0.01:
-            logger.error(f"DISCREPÂNCIA DE DADOS! Histórico ({last_historic_close:.8f}) vs. Real-Time ({real_time_price_native:.8f}).")
-            await send_telegram_message(f"⚠️ **Alerta de Segurança:** Dados históricos inconsistentes. Operação abortada."); return
-        
+        # Lógica de cálculo toda em USD
         sma_col = f'SMA_{ma_period}'; historic_data.ta.sma(close=historic_data['Close'], length=ma_period, append=True)
         previous_candle = historic_data.iloc[-2]; current_candle = historic_data.iloc[-1]
-        current_sma_native = current_candle[sma_col]; previous_close_native = previous_candle['Close']
+        current_sma_usd = current_candle[sma_col]; previous_close_usd = previous_candle['Close']
         
-        logger.info(f"Análise ({pair_details['quote_symbol']}): Preço {real_time_price_native:.8f} | Média {current_sma_native:.8f}")
-        
-        is_sol_pair = pair_details['quote_symbol'] in ['SOL', 'WSOL']; quote_price_usd = 1.0
-        if is_sol_pair:
-            sol_price_usd = real_time_price_usd / real_time_price_native if real_time_price_native > 0 else None
-            if not sol_price_usd:
-                sol_price_data = await fetch_dexscreener_prices(SOL_USDC_PAIR_ADDRESS)
-                if sol_price_data and sol_price_data['pair_price_usd']: sol_price_usd = sol_price_data['pair_price_usd']
-            if not sol_price_usd: logger.error("Falha CRÍTICA ao obter preço do SOL para log."); return
-            quote_price_usd = sol_price_usd
-        current_sma_usd = current_sma_native * quote_price_usd
         logger.info(f"Análise (USD): Preço ${real_time_price_usd:.8f} | Média ${current_sma_usd:.8f}")
 
         if in_position:
@@ -201,10 +180,10 @@ async def check_strategy():
             logger.info(f"Posição Aberta: Entrada ${entry_price:.6f}, Máxima ${position_high_price:.6f}, Alvo TP ${take_profit_target_usd:.6f}, Stop Móvel ${trailing_stop_price_usd:.6f}")
             if real_time_price_usd >= take_profit_target_usd: await execute_sell_order(reason=f"Take Profit atingido em ${take_profit_target_usd:.6f}"); return
             if real_time_price_usd <= trailing_stop_price_usd: await execute_sell_order(reason=f"Trailing Stop atingido em ${trailing_stop_price_usd:.6f}"); return
-            sell_signal = previous_close_native > current_sma_native and real_time_price_native < current_sma_native
+            sell_signal = previous_close_usd > current_sma_usd and real_time_price_usd < current_sma_usd
             if sell_signal: await execute_sell_order(reason="Cruzamento de Média Móvel"); return
         
-        buy_signal = previous_close_native < current_sma_native and real_time_price_native > current_sma_native
+        buy_signal = previous_close_usd < current_sma_usd and real_time_price_usd > current_sma_usd
         if not in_position and buy_signal: logger.info("Sinal de COMPRA detectado."); await execute_buy_order(amount, real_time_price_usd)
     except Exception as e: logger.error(f"Erro em check_strategy: {e}", exc_info=True); await send_telegram_message(f"⚠️ Erro inesperado na estratégia: {e}")
 
@@ -264,9 +243,9 @@ async def set_params(update, context):
             f"💰 *Valor/Ordem:* `{amount}` {quote_token_symbol}\n"
             f"📈 *Take Profit:* `{take_profit_percent}%`\n"
             f"📉 *Trailing Stop:* `{trailing_stop_percent}%`", parse_mode='Markdown')
-    except (IndexError, ValueError): await update.effective_message.reply_text("⚠️ *Formato incorreto.*\nUse: `/set <ENDEREÇO_DO_PAR> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown')
     except Exception as e: logger.error(f"Erro em set_params: {e}"); await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")
 
+# --- Outras funções do bot (run, stop, buy, sell, etc) ---
 async def run_bot(update, context):
     global bot_running, periodic_task
     if not all(p is not None for p in {k: v for k, v in parameters.items() if k != 'trade_pair_details'}): await update.effective_message.reply_text("Defina os parâmetros com /set primeiro."); return
@@ -287,7 +266,7 @@ async def manual_buy(update, context):
     logger.info("Forçando compra..."); await update.effective_message.reply_text("Forçando ordem de compra...")
     try:
         price_data = await fetch_dexscreener_prices(parameters['trade_pair_details']['pair_address'])
-        real_time_price_usd = price_data.get('pair_price_usd') if price_data else None
+        real_time_price_usd = price_data.get('price_usd') if price_data else None
         if real_time_price_usd and real_time_price_usd > 0: await execute_buy_order(parameters["amount"], real_time_price_usd)
         else: raise ValueError("Preço em USD inválido ou nulo")
     except Exception as e: logger.error(f"Erro na compra manual: {e}"); await update.effective_message.reply_text("⚠️ Falha ao obter o preço para compra.")
@@ -304,8 +283,6 @@ async def periodic_checker():
             if bot_running: logger.info("Executando verificação periódica..."); await check_strategy()
         except asyncio.CancelledError: logger.info("Verificador periódico cancelado."); break
         except Exception as e: logger.error(f"Erro no loop periódico: {e}"); await asyncio.sleep(60)
-
-# --- Loop Principal e Inicialização ---
 def main():
     global application
     keep_alive()
