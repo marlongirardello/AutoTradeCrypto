@@ -64,21 +64,21 @@ except Exception as e:
 SOL_USDC_PAIR_ADDRESS = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqb_AB2M_AcV1G_c"
 bot_running = False
 in_position = False
-entry_price = 0.0 # Sempre armazenado em USD
-position_high_price = 0.0 # <-- NOVO: Armazena a máxima da posição para o Trailing Stop
+entry_price = 0.0 # Armazenado em USD
+position_high_price = 0.0 # Armazena a máxima da posição para o Trailing Stop
 check_interval_seconds = 3600
 periodic_task = None
 parameters = {
     "base_token_symbol": None, "quote_token_symbol": None, "timeframe": None,
     "ma_period": None, "amount": None,
-    "take_profit_percent": None, # <-- NOVO
-    "trailing_stop_percent": None, # <-- NOVO (substitui o stop_loss_percent)
+    "take_profit_percent": None, 
+    "trailing_stop_percent": None,
     "trade_pair_details": {}
 }
 application = None
 
 # --- Funções de Execução de Ordem (Jupiter API) ---
-async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=1000):
+async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=1000): # Slippage 1%
     logger.info(f"Iniciando swap de {amount} de {input_mint_str} para {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     async with httpx.AsyncClient() as client:
@@ -104,14 +104,10 @@ async def execute_buy_order(amount, price_usd):
     details = parameters["trade_pair_details"]; logger.info(f"EXECUTANDO COMPRA de {amount} {details['quote_symbol']} para {details['base_symbol']} a ${price_usd}")
     tx_sig = await execute_swap(details['quote_address'], details['base_address'], amount, details['quote_decimals'])
     if tx_sig:
-        in_position = True
-        entry_price = price_usd
-        position_high_price = price_usd # <-- NOVO: Inicia a máxima da posição com o preço de entrada
+        in_position = True; entry_price = price_usd; position_high_price = price_usd
         await send_telegram_message(f"✅ COMPRA: {amount} {details['quote_symbol']} para {details['base_symbol']}\nPreço Entrada: ${price_usd:.6f}\nhttps://solscan.io/tx/{tx_sig}")
     else:
-        in_position = False
-        entry_price = 0.0
-        position_high_price = 0.0
+        in_position = False; entry_price = 0.0; position_high_price = 0.0
         await send_telegram_message(f"❌ FALHA NA COMPRA de {details['base_symbol']}")
 
 async def execute_sell_order(reason="Venda Manual"):
@@ -125,7 +121,7 @@ async def execute_sell_order(reason="Venda Manual"):
         if amount_to_sell_wei == 0: logger.warning("Saldo zero. Resetando posição."); in_position = False; entry_price = 0.0; position_high_price = 0.0; return
         tx_sig = await execute_swap(details['base_address'], details['quote_address'], amount_to_sell, token_decimals)
         if tx_sig:
-            in_position = False; entry_price = 0.0; position_high_price = 0.0 # <-- NOVO: Reseta a máxima
+            in_position = False; entry_price = 0.0; position_high_price = 0.0
             await send_telegram_message(f"🛑 VENDA: {amount_to_sell:.6f} {details['base_symbol']}\nMotivo: {reason}\nhttps://solscan.io/tx/{tx_sig}")
         else:
             await send_telegram_message(f"❌ FALHA NA VENDA de {details['base_symbol']}")
@@ -166,11 +162,11 @@ async def check_strategy():
     try:
         pair_details = parameters["trade_pair_details"]; timeframe, ma_period = parameters["timeframe"], int(parameters["ma_period"])
         amount = parameters["amount"]; take_profit_percent = parameters["take_profit_percent"]; trailing_stop_percent = parameters["trailing_stop_percent"]
-
+        
         logger.info("Coletando dados de Dexscreener (real-time) e GeckoTerminal (histórico)...")
         price_data = await fetch_dexscreener_prices(pair_details['pair_address'])
         historic_data = await fetch_geckoterminal_ohlcv(pair_details['pair_address'], timeframe)
-
+        
         if not price_data or historic_data is None or historic_data.empty: await send_telegram_message("⚠️ Falha ao obter dados. Análise abortada."); return
         real_time_price_native = price_data.get('pair_price_native'); real_time_price_usd = price_data.get('pair_price_usd')
         if not real_time_price_native or not real_time_price_usd or len(historic_data) < ma_period: await send_telegram_message("⚠️ Dados insuficientes. Análise abortada."); return
@@ -186,100 +182,89 @@ async def check_strategy():
         current_sma_native = current_candle[sma_col]; previous_close_native = previous_candle['Close']
         
         logger.info(f"Análise ({pair_details['quote_symbol']}): Preço {real_time_price_native:.8f} | Média {current_sma_native:.8f}")
+        
+        is_sol_pair = pair_details['quote_symbol'] in ['SOL', 'WSOL']; quote_price_usd = 1.0
+        if is_sol_pair:
+            sol_price_usd = real_time_price_usd / real_time_price_native if real_time_price_native > 0 else None
+            if not sol_price_usd:
+                sol_price_data = await fetch_dexscreener_prices(SOL_USDC_PAIR_ADDRESS)
+                if sol_price_data and sol_price_data['pair_price_usd']: sol_price_usd = sol_price_data['pair_price_usd']
+            if not sol_price_usd: logger.error("Falha CRÍTICA ao obter preço do SOL para log."); return
+            quote_price_usd = sol_price_usd
+        current_sma_usd = current_sma_native * quote_price_usd
+        logger.info(f"Análise (USD): Preço ${real_time_price_usd:.8f} | Média ${current_sma_usd:.8f}")
 
-        # Lógica de Venda para Posições Abertas
         if in_position:
-            # 1. Atualiza o preço máximo da posição
-            if real_time_price_usd > position_high_price:
-                position_high_price = real_time_price_usd
-            
-            # 2. Calcula os alvos de Take Profit e Trailing Stop
+            if real_time_price_usd > position_high_price: position_high_price = real_time_price_usd
             take_profit_target_usd = entry_price * (1 + take_profit_percent / 100)
             trailing_stop_price_usd = position_high_price * (1 - trailing_stop_percent / 100)
-            
             logger.info(f"Posição Aberta: Entrada ${entry_price:.6f}, Máxima ${position_high_price:.6f}, Alvo TP ${take_profit_target_usd:.6f}, Stop Móvel ${trailing_stop_price_usd:.6f}")
-
-            # 3. Verifica as condições de venda (a primeira que acontecer, vende)
-            if real_time_price_usd >= take_profit_target_usd:
-                await execute_sell_order(reason=f"Take Profit atingido em ${take_profit_target_usd:.6f}")
-                return
-            
-            if real_time_price_usd <= trailing_stop_price_usd:
-                await execute_sell_order(reason=f"Trailing Stop atingido em ${trailing_stop_price_usd:.6f}")
-                return
-
+            if real_time_price_usd >= take_profit_target_usd: await execute_sell_order(reason=f"Take Profit atingido em ${take_profit_target_usd:.6f}"); return
+            if real_time_price_usd <= trailing_stop_price_usd: await execute_sell_order(reason=f"Trailing Stop atingido em ${trailing_stop_price_usd:.6f}"); return
             sell_signal = previous_close_native > current_sma_native and real_time_price_native < current_sma_native
-            if sell_signal:
-                await execute_sell_order(reason="Cruzamento de Média Móvel")
-                return
-
-        # Lógica de Compra para Posições Fechadas
+            if sell_signal: await execute_sell_order(reason="Cruzamento de Média Móvel"); return
+        
         buy_signal = previous_close_native < current_sma_native and real_time_price_native > current_sma_native
-        if not in_position and buy_signal:
-            logger.info("Sinal de COMPRA detectado.")
-            await execute_buy_order(amount, real_time_price_usd)
-
+        if not in_position and buy_signal: logger.info("Sinal de COMPRA detectado."); await execute_buy_order(amount, real_time_price_usd)
     except Exception as e: logger.error(f"Erro em check_strategy: {e}", exc_info=True); await send_telegram_message(f"⚠️ Erro inesperado na estratégia: {e}")
 
 # --- Funções e Comandos do Telegram ---
 async def send_telegram_message(message):
     if application: await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
-
 async def start(update, context):
     await update.effective_message.reply_text(
         'Olá! Sou seu bot de autotrade para a rede Solana.\n\n'
         '**Fonte de Dados:** `GeckoTerminal + Dexscreener`\n'
         '**Negociação:** `Jupiter`\n\n'
-        'Use `/set` para configurar:\n'
-        '`/set <TOKEN> <COTAÇÃO> <TF> <MA> <VALOR> <TP_%> <TS_%>`\n\n'
+        'Use `/set` para configurar com o **ENDEREÇO DO PAR**:\n'
+        '`/set <ENDEREÇO_DO_PAR> <TF> <MA> <VALOR> <TP_%> <TS_%>`\n\n'
         '**Exemplo (WIF/SOL):**\n'
-        '`/set EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzL7M6fV2zY2g6 SOL 1h 21 0.1 25 10`\n\n'
-        'Onde `TP_%` é o Take Profit e `TS_%` é o Trailing Stop.\n\n'
+        '`/set EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzL7M6fV2zY2g6 1h 21 0.1 25 10`\n\n'
+        '**Importante:** Use o endereço do PAR de maior liquidez que você encontra no Dexscreener.\n\n'
         '**Comandos:**\n`/run` | `/stop` | `/buy` | `/sell`', parse_mode='Markdown')
-
 async def set_params(update, context):
     global parameters, check_interval_seconds
     if bot_running: await update.effective_message.reply_text("Pare o bot com /stop antes."); return
     try:
-        # Posições dos argumentos: 0:TOKEN, 1:COTAÇÃO, 2:TF, 3:MA, 4:VALOR, 5:TP_%, 6:TS_%
-        if len(context.args) != 7:
-            await update.effective_message.reply_text("⚠️ *Erro: Número incorreto de parâmetros.*\nUse: `/set <TOKEN> <COTAÇÃO> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown'); return
-
-        base_token_contract = context.args[0]; quote_symbol_input = context.args[1].upper(); timeframe, ma_period = context.args[2].lower(), int(context.args[3])
-        amount = float(context.args[4]); take_profit_percent = float(context.args[5]); trailing_stop_percent = float(context.args[6])
+        if len(context.args) != 6:
+            await update.effective_message.reply_text("⚠️ *Erro: Formato incorreto.*\nUse: `/set <ENDEREÇO_DO_PAR> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown'); return
+        
+        pair_address = context.args[0]; timeframe, ma_period = context.args[1].lower(), int(context.args[2])
+        amount = float(context.args[3]); take_profit_percent = float(context.args[4]); trailing_stop_percent = float(context.args[5])
         
         interval_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
         if timeframe not in interval_map: await update.effective_message.reply_text(f"⚠️ Timeframe '{timeframe}' não suportado."); return
         check_interval_seconds = interval_map[timeframe]
         
-        token_search_url = f"https://api.dexscreener.com/latest/dex/tokens/{base_token_contract}"
+        pair_search_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
         async with httpx.AsyncClient() as client:
-            response = await client.get(token_search_url); response.raise_for_status(); token_res = response.json()
+            response = await client.get(pair_search_url); response.raise_for_status(); pair_res = response.json()
         
-        if not token_res.get('pairs'): await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado."); return
-        accepted_symbols = [quote_symbol_input]; 
-        if quote_symbol_input == 'SOL': accepted_symbols.append('WSOL')
-        
-        valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') in accepted_symbols]
-        if not valid_pairs: await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado."); return
-        
-        trade_pair = max(valid_pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
+        trade_pair = pair_res.get('pair')
+        if not trade_pair: await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para o endereço fornecido."); return
+
         base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$'); quote_token_symbol = trade_pair['quoteToken']['symbol']
         
         parameters = {
             "base_token_symbol": base_token_symbol, "quote_token_symbol": quote_token_symbol, "timeframe": timeframe,
             "ma_period": ma_period, "amount": amount,
             "take_profit_percent": take_profit_percent, "trailing_stop_percent": trailing_stop_percent,
-            "trade_pair_details": { "base_symbol": base_token_symbol, "quote_symbol": quote_token_symbol, "base_address": trade_pair['baseToken']['address'], "quote_address": trade_pair['quoteToken']['address'], "pair_address": trade_pair['pairAddress'], "quote_decimals": 9 if quote_token_symbol in ['SOL', 'WSOL'] else 6 }
+            "trade_pair_details": { 
+                "base_symbol": base_token_symbol, "quote_symbol": quote_token_symbol, 
+                "base_address": trade_pair['baseToken']['address'], "quote_address": trade_pair['quoteToken']['address'], 
+                "pair_address": trade_pair['pairAddress'], 
+                "quote_decimals": 9 if quote_token_symbol in ['SOL', 'WSOL'] else 6 
+            }
         }
         await update.effective_message.reply_text(
             f"✅ *Parâmetros definidos!*\n\n"
             f"🪙 *Par:* `{base_token_symbol}/{quote_token_symbol}`\n"
+            f"*Endereço do Par:* `{trade_pair['pairAddress']}`\n"
             f"⏰ *Timeframe:* `{timeframe}` | *MA:* `{ma_period}`\n"
-            f"💰 *Valor/Ordem:* `{amount}` {quote_symbol_input}\n"
+            f"💰 *Valor/Ordem:* `{amount}` {quote_token_symbol}\n"
             f"📈 *Take Profit:* `{take_profit_percent}%`\n"
             f"📉 *Trailing Stop:* `{trailing_stop_percent}%`", parse_mode='Markdown')
-    except (IndexError, ValueError): await update.effective_message.reply_text("⚠️ *Formato incorreto.*\nUse: `/set <TOKEN> <COTAÇÃO> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown')
+    except (IndexError, ValueError): await update.effective_message.reply_text("⚠️ *Formato incorreto.*\nUse: `/set <ENDEREÇO_DO_PAR> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown')
     except Exception as e: logger.error(f"Erro em set_params: {e}"); await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")
 
 async def run_bot(update, context):
@@ -289,15 +274,13 @@ async def run_bot(update, context):
     bot_running = True; logger.info("Bot de trade iniciado."); await update.effective_message.reply_text("🚀 Bot iniciado!")
     if periodic_task is None or periodic_task.done(): periodic_task = asyncio.create_task(periodic_checker())
     await check_strategy()
-
 async def stop_bot(update, context):
     global bot_running, in_position, entry_price, position_high_price, periodic_task
     if not bot_running: await update.effective_message.reply_text("O bot já está parado."); return
     bot_running = False
     if periodic_task: periodic_task.cancel(); periodic_task = None
-    in_position, entry_price, position_high_price = False, 0.0, 0.0 # <-- NOVO: Reseta a máxima
+    in_position, entry_price, position_high_price = False, 0.0, 0.0
     logger.info("Bot de trade parado."); await update.effective_message.reply_text("🛑 Bot parado.")
-
 async def manual_buy(update, context):
     if not bot_running: await update.effective_message.reply_text("Use /run primeiro."); return
     if in_position: await update.effective_message.reply_text("Já existe uma posição aberta."); return
@@ -308,13 +291,11 @@ async def manual_buy(update, context):
         if real_time_price_usd and real_time_price_usd > 0: await execute_buy_order(parameters["amount"], real_time_price_usd)
         else: raise ValueError("Preço em USD inválido ou nulo")
     except Exception as e: logger.error(f"Erro na compra manual: {e}"); await update.effective_message.reply_text("⚠️ Falha ao obter o preço para compra.")
-
 async def manual_sell(update, context):
     if not bot_running: await update.effective_message.reply_text("Use /run primeiro."); return
     if not in_position: await update.effective_message.reply_text("Nenhuma posição aberta."); return
     logger.info("Forçando venda..."); await update.effective_message.reply_text("Forçando ordem de venda...")
     await execute_sell_order()
-
 async def periodic_checker():
     logger.info(f"Verificador periódico iniciado: intervalo de {check_interval_seconds}s.")
     while True:
