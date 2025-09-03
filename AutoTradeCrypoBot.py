@@ -95,6 +95,7 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, 
             logger.info(f"Transação enviada: {tx_signature}"); solana_client.confirm_transaction(tx_signature, commitment="confirmed")
             logger.info(f"Transação confirmada: https://solscan.io/tx/{tx_signature}"); return str(tx_signature)
         except Exception as e: logger.error(f"Falha na transação: {e}"); await send_telegram_message(f"⚠️ Falha on-chain: {e}"); return None
+
 async def execute_buy_order(amount, price_usd):
     global in_position, entry_price, position_high_price
     details = parameters["trade_pair_details"]; logger.info(f"EXECUTANDO COMPRA de {amount} {details['quote_symbol']} para {details['base_symbol']} a ${price_usd}")
@@ -105,6 +106,7 @@ async def execute_buy_order(amount, price_usd):
     else:
         in_position = False; entry_price = 0.0; position_high_price = 0.0
         await send_telegram_message(f"❌ FALHA NA COMPRA de {details['base_symbol']}")
+
 async def execute_sell_order(reason="Venda Manual"):
     global in_position, entry_price, position_high_price
     details = parameters["trade_pair_details"]; logger.info(f"EXECUTANDO VENDA de {details['base_symbol']}. Motivo: {reason}")
@@ -140,6 +142,7 @@ async def fetch_geckoterminal_ohlcv(pair_address, timeframe):
                 return df.sort_values(by='timestamp').reset_index(drop=True)
             logger.warning(f"GeckoTerminal não retornou dados de velas: {api_data}"); return None
     except Exception as e: logger.error(f"Erro ao buscar dados no GeckoTerminal: {e}"); return None
+
 async def fetch_dexscreener_prices(pair_address):
     url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
     try:
@@ -166,7 +169,6 @@ async def check_strategy():
         real_time_price_usd = price_data.get('price_usd')
         if not real_time_price_usd or len(historic_data) < ma_period: await send_telegram_message("⚠️ Dados insuficientes. Análise abortada."); return
         
-        # Lógica de cálculo toda em USD
         sma_col = f'SMA_{ma_period}'; historic_data.ta.sma(close=historic_data['Close'], length=ma_period, append=True)
         previous_candle = historic_data.iloc[-2]; current_candle = historic_data.iloc[-1]
         current_sma_usd = current_candle[sma_col]; previous_close_usd = previous_candle['Close']
@@ -190,38 +192,46 @@ async def check_strategy():
 # --- Funções e Comandos do Telegram ---
 async def send_telegram_message(message):
     if application: await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
+
 async def start(update, context):
     await update.effective_message.reply_text(
         'Olá! Sou seu bot de autotrade para a rede Solana.\n\n'
         '**Fonte de Dados:** `GeckoTerminal + Dexscreener`\n'
         '**Negociação:** `Jupiter`\n\n'
-        'Use `/set` para configurar com o **ENDEREÇO DO PAR**:\n'
-        '`/set <ENDEREÇO_DO_PAR> <TF> <MA> <VALOR> <TP_%> <TS_%>`\n\n'
-        '**Exemplo (WIF/SOL):**\n'
-        '`/set EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzL7M6fV2zY2g6 1h 21 0.1 25 10`\n\n'
-        '**Importante:** Use o endereço do PAR de maior liquidez que você encontra no Dexscreener.\n\n'
+        'Use `/set` para configurar com o **ENDEREÇO DO TOKEN**:\n' # <-- Restaurado
+        '`/set <ENDEREÇO_DO_TOKEN> <COTAÇÃO> <TF> <MA> <VALOR> <TP_%> <TS_%>`\n\n'
+        '**Exemplo (TROLL/SOL):**\n'
+        '`/set 5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2 SOL 1h 21 0.1 25 10`\n\n'
         '**Comandos:**\n`/run` | `/stop` | `/buy` | `/sell`', parse_mode='Markdown')
+
+# <-- FUNÇÃO /set RESTAURADA ---
 async def set_params(update, context):
     global parameters, check_interval_seconds
     if bot_running: await update.effective_message.reply_text("Pare o bot com /stop antes."); return
     try:
-        if len(context.args) != 6:
-            await update.effective_message.reply_text("⚠️ *Erro: Formato incorreto.*\nUse: `/set <ENDEREÇO_DO_PAR> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown'); return
+        # Posições: 0:TOKEN, 1:COTAÇÃO, 2:TF, 3:MA, 4:VALOR, 5:TP_%, 6:TS_%
+        if len(context.args) != 7:
+            await update.effective_message.reply_text("⚠️ *Erro: Formato incorreto.*\nUse: `/set <TOKEN> <COTAÇÃO> <TF> <MA> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown'); return
         
-        pair_address = context.args[0]; timeframe, ma_period = context.args[1].lower(), int(context.args[2])
-        amount = float(context.args[3]); take_profit_percent = float(context.args[4]); trailing_stop_percent = float(context.args[5])
+        base_token_contract = context.args[0]; quote_symbol_input = context.args[1].upper(); timeframe, ma_period = context.args[2].lower(), int(context.args[3])
+        amount = float(context.args[4]); take_profit_percent = float(context.args[5]); trailing_stop_percent = float(context.args[6])
         
         interval_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
         if timeframe not in interval_map: await update.effective_message.reply_text(f"⚠️ Timeframe '{timeframe}' não suportado."); return
         check_interval_seconds = interval_map[timeframe]
         
-        pair_search_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+        token_search_url = f"https://api.dexscreener.com/latest/dex/tokens/{base_token_contract}"
         async with httpx.AsyncClient() as client:
-            response = await client.get(pair_search_url); response.raise_for_status(); pair_res = response.json()
+            response = await client.get(token_search_url); response.raise_for_status(); token_res = response.json()
         
-        trade_pair = pair_res.get('pair')
-        if not trade_pair: await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para o endereço fornecido."); return
-
+        if not token_res.get('pairs'): await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para este contrato."); return
+        accepted_symbols = [quote_symbol_input]
+        if quote_symbol_input == 'SOL': accepted_symbols.append('WSOL')
+        
+        valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') in accepted_symbols]
+        if not valid_pairs: await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado."); return
+        
+        trade_pair = max(valid_pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
         base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$'); quote_token_symbol = trade_pair['quoteToken']['symbol']
         
         parameters = {
@@ -237,10 +247,10 @@ async def set_params(update, context):
         }
         await update.effective_message.reply_text(
             f"✅ *Parâmetros definidos!*\n\n"
-            f"🪙 *Par:* `{base_token_symbol}/{quote_token_symbol}`\n"
+            f"🪙 *Par Encontrado:* `{base_token_symbol}/{quote_token_symbol}`\n"
             f"*Endereço do Par:* `{trade_pair['pairAddress']}`\n"
             f"⏰ *Timeframe:* `{timeframe}` | *MA:* `{ma_period}`\n"
-            f"💰 *Valor/Ordem:* `{amount}` {quote_token_symbol}\n"
+            f"💰 *Valor/Ordem:* `{amount}` {quote_symbol_input}\n"
             f"📈 *Take Profit:* `{take_profit_percent}%`\n"
             f"📉 *Trailing Stop:* `{trailing_stop_percent}%`", parse_mode='Markdown')
     except Exception as e: logger.error(f"Erro em set_params: {e}"); await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")
