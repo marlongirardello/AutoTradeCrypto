@@ -154,6 +154,7 @@ async def fetch_dexscreener_prices(pair_address):
     except Exception as e: logger.error(f"Erro ao buscar preços no Dexscreener: {e}"); return None
 
 # --- LÓGICA CENTRAL DA ESTRATÉGIA (BASEADA EM USD) ---
+# --- LÓGICA CENTRAL DA ESTRATÉGIA (CORRIGIDA) ---
 async def check_strategy():
     global in_position, entry_price, position_high_price
     if not bot_running or not all(p is not None for p in {k: v for k, v in parameters.items() if k != 'trade_pair_details'}): return
@@ -169,9 +170,11 @@ async def check_strategy():
         real_time_price_usd = price_data.get('price_usd')
         if not real_time_price_usd or len(historic_data) < ma_period: await send_telegram_message("⚠️ Dados insuficientes. Análise abortada."); return
         
+        # Lógica de cálculo toda em USD
         sma_col = f'SMA_{ma_period}'; historic_data.ta.sma(close=historic_data['Close'], length=ma_period, append=True)
         previous_candle = historic_data.iloc[-2]; current_candle = historic_data.iloc[-1]
         current_sma_usd = current_candle[sma_col]; previous_close_usd = previous_candle['Close']
+        previous_sma_usd = previous_candle[sma_col] # Pega a média da vela anterior
         
         logger.info(f"Análise (USD): Preço ${real_time_price_usd:.8f} | Média ${current_sma_usd:.8f}")
 
@@ -182,13 +185,21 @@ async def check_strategy():
             logger.info(f"Posição Aberta: Entrada ${entry_price:.6f}, Máxima ${position_high_price:.6f}, Alvo TP ${take_profit_target_usd:.6f}, Stop Móvel ${trailing_stop_price_usd:.6f}")
             if real_time_price_usd >= take_profit_target_usd: await execute_sell_order(reason=f"Take Profit atingido em ${take_profit_target_usd:.6f}"); return
             if real_time_price_usd <= trailing_stop_price_usd: await execute_sell_order(reason=f"Trailing Stop atingido em ${trailing_stop_price_usd:.6f}"); return
-            sell_signal = previous_close_usd > current_sma_usd and real_time_price_usd < current_sma_usd
+            
+            # <-- LÓGICA DE VENDA CORRIGIDA
+            sell_signal = previous_close_usd > previous_sma_usd and real_time_price_usd < current_sma_usd
             if sell_signal: await execute_sell_order(reason="Cruzamento de Média Móvel"); return
         
-        buy_signal = previous_close_usd < current_sma_usd and real_time_price_usd > current_sma_usd
-        if not in_position and buy_signal: logger.info("Sinal de COMPRA detectado."); await execute_buy_order(amount, real_time_price_usd)
-    except Exception as e: logger.error(f"Erro em check_strategy: {e}", exc_info=True); await send_telegram_message(f"⚠️ Erro inesperado na estratégia: {e}")
-
+        # <-- LÓGICA DE COMPRA CORRIGIDA
+        buy_signal = previous_close_usd < previous_sma_usd and real_time_price_usd > current_sma_usd
+        if not in_position and buy_signal: 
+            logger.info("Sinal de COMPRA detectado.")
+            await execute_buy_order(amount, real_time_price_usd)
+            
+    except Exception as e: 
+        logger.error(f"Erro em check_strategy: {e}", exc_info=True)
+        await send_telegram_message(f"⚠️ Erro inesperado na estratégia: {e}")
+        
 # --- Funções e Comandos do Telegram ---
 async def send_telegram_message(message):
     if application: await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
@@ -304,3 +315,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
