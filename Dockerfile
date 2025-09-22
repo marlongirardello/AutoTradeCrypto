@@ -16,7 +16,7 @@ COPY requirements.txt .
 
 # Atualizar o pip e instalar as bibliotecas Python
 RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+RUN echo "Invalidando cache em $(date)" && pip install --no-cache-dir -r requirements.txt
 
 # Copiar o resto do código da aplicação para o contentor
 COPY . .
