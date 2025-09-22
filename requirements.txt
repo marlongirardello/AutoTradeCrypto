@@ -1,5 +1,5 @@
 python-telegram-bot
-pandas
+pandas>=2.2.0
 pandas-ta
 httpx
 python-dotenv
