@@ -81,10 +81,10 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, 
     amount_wei = int(amount * (10**input_decimals))
     async with httpx.AsyncClient() as client:
         try:
-            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
+            quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
             quote_res = await client.get(quote_url, timeout=30.0); quote_res.raise_for_status(); quote_response = quote_res.json()
             swap_payload = {"userPublicKey": str(payer.pubkey()), "quoteResponse": quote_response, "wrapAndUnwrapSol": True}
-            swap_url = "https://quote-api.jup.ag/v6/swap"
+            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             swap_res = await client.post(swap_url, json=swap_payload, timeout=30.0); swap_res.raise_for_status(); swap_response = swap_res.json()
             swap_tx_b64 = swap_response.get('swapTransaction')
             if not swap_tx_b64: logger.error(f"Erro na API Jupiter: {swap_response}"); return None
@@ -315,4 +315,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
